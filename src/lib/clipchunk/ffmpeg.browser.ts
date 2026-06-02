@@ -1,11 +1,12 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import { fetchFile } from "@ffmpeg/util";
 import type { Overlay, VideoMeta, ChunkResult } from "./types";
+import coreUrl from "@ffmpeg/core?url";
+import wasmUrl from "@ffmpeg/core/wasm?url";
+import workerUrl from "@ffmpeg/ffmpeg/worker?url";
 
 let _ffmpeg: FFmpeg | null = null;
 let _loadPromise: Promise<FFmpeg> | null = null;
-
-const CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
 
 export async function getFFmpeg(onLog?: (m: string) => void): Promise<FFmpeg> {
   if (_ffmpeg) return _ffmpeg;
@@ -14,8 +15,9 @@ export async function getFFmpeg(onLog?: (m: string) => void): Promise<FFmpeg> {
     const ff = new FFmpeg();
     if (onLog) ff.on("log", ({ message }) => onLog(message));
     await ff.load({
-      coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+      coreURL: coreUrl,
+      wasmURL: wasmUrl,
+      classWorkerURL: workerUrl,
     });
     _ffmpeg = ff;
     return ff;
@@ -38,6 +40,24 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   const { video, overlays, chunkSeconds, onProgress } = opts;
   const ff = await getFFmpeg();
 
+  // Attach progress and logs so the UI can show live updates during execs.
+  let currentChunk = 0;
+  try {
+    ff.setProgress(({ ratio }) => {
+      const total = Math.max(1, Math.ceil(video.duration / chunkSeconds));
+      const overallPct = Math.round(((currentChunk + ratio) / total) * 100);
+      onProgress({ current: currentChunk + ratio, total, pct: overallPct, label: `Processing chunk ${currentChunk + 1} of ${total} (${Math.round(ratio * 100)}%)` });
+    });
+  } catch {
+    // setProgress may not be available on older builds; ignore if not present
+  }
+  try {
+    ff.on("log", ({ message }) => {
+      // show ffmpeg log messages in the UI without overwriting percentage
+      try { onProgress({ current: currentChunk, total: Math.max(1, Math.ceil(video.duration / chunkSeconds)), pct: 0, label: message }); } catch {}
+    });
+  } catch {}
+
   // Write video
   onProgress({ current: 0, total: 1, pct: 0, label: "Preparing video…" });
   await ff.writeFile("input.mp4", await fetchFile(video.file));
@@ -53,6 +73,7 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   const results: ChunkResult[] = [];
 
   for (let i = 0; i < total; i++) {
+    currentChunk = i;
     const start = i * chunkSeconds;
     const dur = Math.min(chunkSeconds, video.duration - start);
     const outName = `chunk_${String(i + 1).padStart(3, "0")}.mp4`;
@@ -92,7 +113,12 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
       );
     }
 
-    await ff.exec(args);
+    try {
+      await ff.exec(args);
+    } catch (err: any) {
+      try { onProgress({ current: i + 1, total, pct: Math.round((i / total) * 100), label: `Error processing chunk ${i + 1}: ${String(err?.message ?? err)}` }); } catch {}
+      throw err;
+    }
     const data = await ff.readFile(outName);
     const bytes = data as Uint8Array;
     const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;

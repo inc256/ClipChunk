@@ -6,8 +6,11 @@ import { OverlayPanel } from "./OverlayPanel";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { ExportList } from "./ExportList";
 import type { ChunkResult, Overlay, VideoMeta } from "@/lib/clipchunk/types";
-import { processVideo } from "@/lib/clipchunk/ffmpeg.client";
-import { registerServiceWorker, type InstallPromptEvent } from "@/lib/clipchunk/pwa.client";
+
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
 
 export function ClipChunkApp() {
   const [video, setVideo] = useState<VideoMeta | null>(null);
@@ -26,15 +29,21 @@ export function ClipChunkApp() {
   const [offlineReady, setOfflineReady] = useState(false);
 
   useEffect(() => {
-    function onBip(e: Event) { e.preventDefault(); setInstallEvent(e as InstallPromptEvent); }
-    function onInstalled() { setInstalled(true); setInstallEvent(null); }
-    window.addEventListener("beforeinstallprompt", onBip);
-    window.addEventListener("appinstalled", onInstalled);
-    registerServiceWorker(() => setOfflineReady(true));
-    return () => {
-      window.removeEventListener("beforeinstallprompt", onBip);
-      window.removeEventListener("appinstalled", onInstalled);
-    };
+    let cleanup = () => {};
+    async function initPwa() {
+      const { registerServiceWorker } = await import("@/lib/clipchunk/pwa.browser");
+      function onBip(e: Event) { e.preventDefault(); setInstallEvent(e as InstallPromptEvent); }
+      function onInstalled() { setInstalled(true); setInstallEvent(null); }
+      window.addEventListener("beforeinstallprompt", onBip);
+      window.addEventListener("appinstalled", onInstalled);
+      registerServiceWorker(() => setOfflineReady(true));
+      cleanup = () => {
+        window.removeEventListener("beforeinstallprompt", onBip);
+        window.removeEventListener("appinstalled", onInstalled);
+      };
+    }
+    void initPwa();
+    return () => cleanup();
   }, []);
 
   const selected = useMemo(() => overlays.find((o) => o.id === selectedId) ?? null, [overlays, selectedId]);
@@ -104,6 +113,7 @@ export function ClipChunkApp() {
     setProcessing(true);
     setProgress({ pct: 0, label: "Loading engine…" });
     try {
+      const { processVideo } = await import("@/lib/clipchunk/ffmpeg.browser");
       const out = await processVideo({
         video,
         overlays,
