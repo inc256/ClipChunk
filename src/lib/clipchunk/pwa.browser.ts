@@ -21,7 +21,22 @@ export function registerServiceWorker(onReady: () => void) {
     return;
   }
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").then(() => {
+    navigator.serviceWorker.register("/sw.js").then((reg) => {
+      try {
+        // Listen for messages from the service worker (OFFLINE_READY, SW_ACTIVATED)
+        navigator.serviceWorker.addEventListener("message", (ev) => {
+          try {
+            const data = ev.data;
+            if (!data) return;
+            if (data.type === "OFFLINE_READY" || data.type === "SW_ACTIVATED") {
+              onReady();
+            }
+          } catch (e) { /* noop */ }
+        });
+      } catch (e) { /* noop */ }
+
+      // Fallback: if registration succeeded but we didn't get an explicit message,
+      // call onReady so UI can mark offline support enabled.
       onReady();
     }).catch(() => {/* noop */});
   });
