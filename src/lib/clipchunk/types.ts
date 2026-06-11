@@ -23,7 +23,7 @@ export interface Overlay {
   w: number;
   h: number;
   rotation: number; // degrees
-  opacity: number; // 0..1
+  opacity: number;  // 0..1
   z: number;
   naturalW: number;
   naturalH: number;
