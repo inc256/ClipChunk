@@ -10,17 +10,56 @@ let _loadPromise: Promise<FFmpeg> | null = null;
 let _logHandler: ((e: { message: string }) => void) | null = null;
 let _progressHandler: ((e: { progress: number; time: number }) => void) | null = null;
 
+const LOAD_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise
+      .then((v) => { clearTimeout(timer); resolve(v); })
+      .catch((e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
 export async function getFFmpeg(onLog?: (m: string) => void): Promise<FFmpeg> {
   if (_ffmpeg) return _ffmpeg;
   if (_loadPromise) return _loadPromise;
+
+  // ffmpeg.wasm's worker relies on SharedArrayBuffer, which browsers only
+  // expose when the page is cross-origin isolated (COOP + COEP headers).
+  // Without it, `ff.load()` can hang rather than throwing a clear error —
+  // fail fast here instead.
+  if (typeof SharedArrayBuffer === "undefined") {
+    throw new Error(
+      "This browser tab is not cross-origin isolated, so the video engine " +
+        "can't load. Make sure the site is served with " +
+        "Cross-Origin-Opener-Policy: same-origin and " +
+        "Cross-Origin-Embedder-Policy: require-corp, then reload the page.",
+    );
+  }
+
   _loadPromise = (async () => {
     const ff = new FFmpeg();
     if (onLog) ff.on("log", ({ message }) => onLog(message));
-    await ff.load({
-      coreURL: coreUrl,
-      wasmURL: wasmUrl,
-      classWorkerURL: workerUrl,
-    });
+    try {
+      await withTimeout(
+        ff.load({
+          coreURL: coreUrl,
+          wasmURL: wasmUrl,
+          classWorkerURL: workerUrl,
+        }),
+        LOAD_TIMEOUT_MS,
+        "FFmpeg engine timed out while loading. This usually means the page " +
+          "is not cross-origin isolated — check that Cross-Origin-Opener-Policy " +
+          "and Cross-Origin-Embedder-Policy headers are set, and that " +
+          "SharedArrayBuffer is available (try a hard refresh).",
+      );
+    } catch (err) {
+      // Reset so the next call can retry instead of permanently reusing a
+      // rejected promise.
+      _loadPromise = null;
+      throw err;
+    }
     _ffmpeg = ff;
     return ff;
   })();

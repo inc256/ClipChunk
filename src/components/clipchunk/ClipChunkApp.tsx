@@ -262,9 +262,9 @@ export function ClipChunkApp() {
         setError(null);
       } else {
         console.error(e);
-        setError(
-          "Processing failed. Check that your video is a valid MP4/WebM and try a smaller chunk size.",
-        );
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(msg || "Processing failed. Check that your video is a valid MP4/WebM and try a smaller chunk size.");
+        setProgress(null);
       }
     } finally {
       setProcessing(false);
