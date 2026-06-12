@@ -2,15 +2,6 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import type { Overlay, VideoMeta, ChunkResult } from "./types";
 
-// Load the (large, ~25 MB) ffmpeg-core wasm/js from a CDN instead of via
-// Vite's `?url` asset pipeline. `@ffmpeg/core` is notoriously fragile to
-// bundle correctly — the previous local-asset approach produced URLs that
-// either 404'd or hung indefinitely inside `ff.load()` after a production
-// build. `toBlobURL` fetches each asset (regular CORS fetch, unaffected by
-// COEP) and converts it to a same-origin `blob:` URL, which the worker can
-// then load without any cross-origin restrictions.
-//
-// Pin an exact version for cache stability / reproducibility.
 const FFMPEG_CORE_VERSION = "0.12.6";
 const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
 
@@ -36,25 +27,38 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 async function fetchWithRetry(url: string, type: string, retries = 3): Promise<string> {
   for (let i = 0; i < retries; i++) {
     try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       return await toBlobURL(url, type);
     } catch (err) {
       if (i === retries - 1) throw err;
+      console.log(`Retry ${i + 1}/${retries} for ${url}`);
       await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
     }
   }
   throw new Error(`Failed to fetch ${url} after ${retries} retries`);
 }
 
+/**
+ * Get worker URL - uses local file for production, CDN for development
+ */
+function getWorkerURL(): string {
+  // In production (Vercel), use the local file from public directory
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
+    return '/ffmpeg/ffmpeg-core.worker.js';
+  }
+  
+  // In development, we can try CDN but with fallback
+  return `${CORE_BASE}/ffmpeg-core.worker.js`;
+}
+
 export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSignal): Promise<FFmpeg> {
   if (_ffmpeg) return _ffmpeg;
 
-  // `@ffmpeg/core` (single-threaded) does not require SharedArrayBuffer —
-  // only the `-mt` (multi-threaded) variant does, which needs COOP/COEP. We
-  // use the standard core via CDN below, so this is informational only.
   if (typeof SharedArrayBuffer === "undefined") {
     onLog?.(
-      "Note: SharedArrayBuffer is unavailable in this tab (no cross-origin " +
-        "isolation). This is fine for the single-threaded ffmpeg core.",
+      "Note: SharedArrayBuffer is unavailable in this tab. " +
+      "This is fine for the single-threaded ffmpeg core.",
     );
   }
 
@@ -74,80 +78,57 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
         const coreURL = await withTimeout(
           fetchWithRetry(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
           LOAD_TIMEOUT_MS,
-          `Timed out fetching ffmpeg-core.js from ${CORE_BASE}. Check your ` +
-            "network connection and that unpkg.com is reachable / not " +
-            "blocked by an extension or CSP.",
+          `Timed out fetching ffmpeg-core.js`,
         );
         
         onLog?.("📥 Fetching ffmpeg-core.wasm…");
         const wasmURL = await withTimeout(
           fetchWithRetry(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
           LOAD_TIMEOUT_MS,
-          `Timed out fetching ffmpeg-core.wasm from ${CORE_BASE}. Check your ` +
-            "network connection and that unpkg.com is reachable / not " +
-            "blocked by an extension or CSP.",
+          `Timed out fetching ffmpeg-core.wasm`,
         );
         
-        // Fetch the worker script from the same CDN
-        onLog?.("📥 Fetching worker script…");
-        let workerURL: string;
-        try {
-          workerURL = await withTimeout(
-            fetchWithRetry(`${CORE_BASE}/ffmpeg-core.worker.js`, "text/javascript"),
-            LOAD_TIMEOUT_MS,
-            `Timed out fetching worker script from ${CORE_BASE}`,
-          );
-          onLog?.("✅ Worker script fetched successfully");
-        } catch (workerErr) {
-          // Fallback: try alternative naming convention
-          onLog?.("⚠️ Could not fetch ffmpeg-core.worker.js, trying alternative names…");
+        // Use local worker file instead of CDN to avoid CORS
+        const workerURL = getWorkerURL();
+        onLog?.(`📥 Using worker from: ${workerURL}`);
+        
+        // Verify worker file exists before attempting to load
+        if (workerURL.startsWith('/')) {
           try {
-            workerURL = await withTimeout(
-              fetchWithRetry(`${CORE_BASE}/worker.js`, "text/javascript"),
-              LOAD_TIMEOUT_MS,
-              "Timed out fetching alternative worker script",
-            );
-            onLog?.("✅ Alternative worker script fetched successfully");
-          } catch (fallbackErr) {
-            // If worker script can't be fetched, try to let FFmpeg handle it
-            onLog?.("⚠️ Could not fetch worker script, will let FFmpeg use default");
-            workerURL = undefined as any;
+            const response = await fetch(workerURL, { method: 'HEAD' });
+            if (!response.ok) {
+              throw new Error(`Worker file not found at ${workerURL} (HTTP ${response.status})`);
+            }
+            onLog?.("✅ Worker file verified");
+          } catch (err) {
+            onLog?.(`⚠️ Could not verify worker file: ${err instanceof Error ? err.message : 'Unknown error'}`);
+            // Continue anyway - let FFmpeg try to load it
           }
         }
         
         onLog?.("🚀 Starting ffmpeg core…");
-        const loadOptions: any = {
-          coreURL,
-          wasmURL,
-        };
-        
-        // Only add workerURL if we successfully fetched it
-        if (workerURL) {
-          loadOptions.workerURL = workerURL;
-        }
-        
         await withTimeout(
-          ff.load(loadOptions),
+          ff.load({
+            coreURL,
+            wasmURL,
+            workerURL, // Use local worker file
+          }),
           LOAD_TIMEOUT_MS,
-          "FFmpeg engine timed out while starting up after the core/wasm " +
-            "were fetched successfully. This points at the worker script " +
-            "(classWorkerURL) — check the Network tab for a failed/blocked " +
-            "request to a *worker*.js file.",
+          "FFmpeg engine timed out while starting up",
         );
         
         onLog?.("✅ FFmpeg engine started successfully!");
       } catch (err) {
-        // Reset so the next call can retry instead of permanently reusing a
-        // rejected promise.
         _loadPromise = null;
         try { ff.terminate(); } catch { /* ignore */ }
         
-        // Provide more detailed error information
         if (err instanceof Error) {
           onLog?.(`❌ FFmpeg load failed: ${err.message}`);
-          if (err.message.includes("worker")) {
-            onLog?.("💡 Tip: Check if your browser is blocking workers or if there's a CORS issue");
-            onLog?.("💡 Try opening the Network tab and looking for failed requests to *.worker.js files");
+          
+          // Provide specific help for worker-related errors
+          if (err.message.includes("worker") || err.message.includes("Worker")) {
+            onLog?.("💡 Tip: Worker file missing. Make sure you've run 'npm run prebuild' to copy the worker file.");
+            onLog?.("💡 Check that /public/ffmpeg/ffmpeg-core.worker.js exists in your build output.");
           }
         }
         throw err;
@@ -158,9 +139,6 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
     })();
   }
 
-  // Race the in-flight load against the caller's abort signal so a stuck
-  // `ff.load()` can be cancelled. Terminating the worker rejects the
-  // pending load promise on the ffmpeg.wasm side too.
   if (signal) {
     return new Promise<FFmpeg>((resolve, reject) => {
       const onAbort = () => {
@@ -179,11 +157,6 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
   return _loadPromise;
 }
 
-/**
- * Forcefully tears down the current FFmpeg worker (if any) and resets module
- * state so the next `getFFmpeg()` call starts fresh. Use this to implement
- * "Cancel" — `ff.exec()` and `ff.load()` cannot be interrupted any other way.
- */
 export function terminateFFmpeg() {
   if (_ffmpeg) {
     try { _ffmpeg.terminate(); } catch { /* ignore */ }
@@ -207,22 +180,6 @@ export interface ProcessOpts {
   signal?: AbortSignal;
 }
 
-/**
- * Splits the video into chunks of `chunkSeconds`, burning visible overlays in.
- * Returns one ChunkResult per produced chunk.
- *
- * Fixes applied vs original:
- *  1. `-ss` / `-t` moved to output side for frame-accurate cuts.
- *  2. `-shortest` added so FFmpeg doesn't hang on infinite image streams.
- *  3. Log & progress listener leak fixed — old handlers are removed before re-attaching.
- *  4. Alpha compositing uses `lutrgb` instead of `colorchannelmixer` so it works
- *     on PNGs that were saved without an alpha channel.
- *  5. AbortSignal support — callers can cancel mid-run.
- *  6. Parallel chunk writes replaced by sequential writes to avoid WASM OOM on
- *     large videos (WASM heap is limited to ~2 GB).
- *  7. Overlay files are written once before the chunk loop, not per chunk.
- *  8. Enhanced error handling with detailed messages.
- */
 export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   const { video, overlays, chunkSeconds, onProgress, signal } = opts;
 
@@ -230,16 +187,11 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
     throw new DOMException("Processing cancelled by user.", "AbortError");
   }
 
-  // Surface load-time log lines (e.g. asset fetch errors) in the UI instead
-  // of swallowing them — this is the only window into *why* load() might hang.
   const ff = await getFFmpeg(
     (message) => onProgress({ current: 0, total: 1, pct: 0, label: message }),
     signal,
   );
 
-  // `ff.exec()` cannot be cancelled cooperatively — the only way to stop it
-  // mid-run is to terminate the worker. Register that here so Cancel works
-  // even while a chunk is actively encoding.
   let aborted = false;
   const onAbortDuringExec = () => {
     aborted = true;
@@ -247,8 +199,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   };
   signal?.addEventListener("abort", onAbortDuringExec);
 
-  // ── Listener management ────────────────────────────────────────────────────
-  // Remove any leftover handlers from a previous run to prevent accumulation.
   if (_logHandler) {
     try { ff.off("log", _logHandler); } catch { /* ignore */ }
   }
@@ -260,7 +210,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   let currentChunk = 0;
 
   _progressHandler = ({ progress }) => {
-    // `progress` from FFmpeg is 0..1 for the current exec call.
     const ratio = Math.max(0, Math.min(1, progress));
     const overallPct = Math.round(((currentChunk + ratio) / total) * 100);
     onProgress({
@@ -272,10 +221,8 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   };
 
   _logHandler = ({ message }) => {
-    // Surface ffmpeg stderr lines without clobbering the percentage counter.
-    // Filter out noisy or expected warning messages
     const ignorePatterns = [
-      /frame=.*fps=.*q=/i,  // FFmpeg progress output
+      /frame=.*fps=.*q=/i,
       /Past duration.*too large/i,
       /buffer is too small/i,
     ];
@@ -295,15 +242,13 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
     } catch { /* ignore */ }
   };
 
-  try { ff.on("progress", _progressHandler); } catch { /* setProgress may not exist */ }
+  try { ff.on("progress", _progressHandler); } catch { /* ignore */ }
   try { ff.on("log", _logHandler); } catch { /* ignore */ }
 
   try {
-    // ── Write source video ───────────────────────────────────────────────────
     onProgress({ current: 0, total, pct: 0, label: "Preparing video…" });
     await ff.writeFile("input.mp4", await fetchFile(video.file));
 
-    // ── Write overlay images (only visible ones, once, before chunk loop) ────
     const active = overlays.filter((o) => o.visible);
     for (let i = 0; i < active.length; i++) {
       const o = active[i];
@@ -318,7 +263,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
 
     const results: ChunkResult[] = [];
 
-    // ── Chunk loop ───────────────────────────────────────────────────────────
     for (let i = 0; i < total; i++) {
       if (aborted || signal?.aborted) {
         throw new DOMException("Processing cancelled by user.", "AbortError");
@@ -336,20 +280,11 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         label: `Processing chunk ${i + 1} of ${total}…`,
       });
 
-      // ── Build ffmpeg args ────────────────────────────────────────────────────
-      //
-      // FIX 1: `-ss` and `-t` are placed AFTER all `-i` flags (output-side
-      // seeking). This is slower than input-side but produces frame-accurate
-      // cuts. For pre-split social content, accuracy matters more than speed.
-      //
       const args: string[] = ["-i", "input.mp4"];
       for (let k = 0; k < active.length; k++) args.push("-i", `ov${k}.png`);
-
-      // Output-side time range
       args.push("-ss", start.toFixed(3), "-t", dur.toFixed(3));
 
       if (active.length === 0) {
-        // No overlays — straight remux/transcode.
         args.push(
           "-c:v", "libx264",
           "-preset", "ultrafast",
@@ -361,21 +296,14 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           outName,
         );
       } else {
-        // ── Build filtergraph ──────────────────────────────────────────────────
         const W = video.width;
         const H = video.height;
         const filters: string[] = [];
 
-        // Sort by z so lower z (further back) is composited first.
         const sorted = [...active]
           .map((o, idx) => ({ o, idx }))
           .sort((a, b) => a.o.z - b.o.z);
 
-        // Scale + alpha each overlay.
-        // FIX 3: Use `lutrgb=a='val*X'` instead of `colorchannelmixer=aa=X`.
-        // `colorchannelmixer` only scales pre-existing alpha; if the PNG was
-        // saved without an alpha channel the filter has no effect.
-        // `format=rgba` + `lutrgb` forces an alpha channel then scales it.
         sorted.forEach(({ o, idx }, n) => {
           const tw = Math.max(2, Math.round(o.w * W));
           const th = Math.max(2, Math.round(o.h * H));
@@ -388,7 +316,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           );
         });
 
-        // Chain overlay filters.
         let last = "[0:v]";
         sorted.forEach(({ o }, n) => {
           const x = Math.round(o.x * W);
@@ -402,9 +329,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           "-filter_complex", filters.join(";"),
           "-map", "[vout]",
           "-map", "0:a?",
-          // FIX 2: `-shortest` prevents FFmpeg hanging because image inputs are
-          // treated as infinite-duration streams. Without this the encoder waits
-          // forever for the image stream to end.
           "-shortest",
           "-c:v", "libx264",
           "-preset", "ultrafast",
@@ -417,7 +341,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         );
       }
 
-      // ── Execute ──────────────────────────────────────────────────────────────
       try {
         await ff.exec(args);
       } catch (err: unknown) {
@@ -431,31 +354,11 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           pct: Math.round((i / total) * 100),
           label: `❌ Error on chunk ${i + 1}: ${msg.substring(0, 150)}`,
         });
-        
-        // Provide helpful tips based on common errors
-        if (msg.includes("memory") || msg.includes("alloc")) {
-          onProgress({
-            current: i + 1,
-            total,
-            pct: Math.round((i / total) * 100),
-            label: "💡 Tip: Try reducing chunk size or video resolution to avoid memory issues",
-          });
-        } else if (msg.includes("codec") || msg.includes("encoder")) {
-          onProgress({
-            current: i + 1,
-            total,
-            pct: Math.round((i / total) * 100),
-            label: "💡 Tip: Video codec may not be supported. Try using H.264 encoded videos.",
-          });
-        }
-        
         throw err;
       }
 
-      // ── Collect output ───────────────────────────────────────────────────────
       const data = await ff.readFile(outName);
       const bytes = data as Uint8Array;
-      // Detach from the WASM heap before creating the Blob so GC can free it.
       const ab = bytes.buffer.slice(
         bytes.byteOffset,
         bytes.byteOffset + bytes.byteLength,
@@ -470,7 +373,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         size: blob.size,
       });
 
-      // Free WASM FS space immediately so large videos don't exhaust the heap.
       try { await ff.deleteFile(outName); } catch { /* ignore */ }
 
       onProgress({
@@ -479,9 +381,8 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         pct: Math.round(((i + 1) / total) * 100),
         label: `✅ Finished chunk ${i + 1} of ${total}`,
       });
-    } // end for (chunk loop)
+    }
 
-    // ── Cleanup ──────────────────────────────────────────────────────────────
     try { await ff.deleteFile("input.mp4"); } catch { /* ignore */ }
     for (let k = 0; k < active.length; k++) {
       try { await ff.deleteFile(`ov${k}.png`); } catch { /* ignore */ }
@@ -495,9 +396,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
     throw err;
   } finally {
     signal?.removeEventListener("abort", onAbortDuringExec);
-    // Detach live handlers so they don't fire during idle time. Skip if the
-    // worker was terminated (terminateFFmpeg already cleared these globals
-    // and `ff` is now a dead reference).
     if (!aborted && _ffmpeg === ff) {
       if (_logHandler) {
         try { ff.off("log", _logHandler); } catch { /* ignore */ }

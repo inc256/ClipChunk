@@ -4,8 +4,9 @@
   "sideEffects": false,
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
+    "prebuild": "node scripts/copy-ffmpeg-worker.js",
     "build": "vite build",
+    "dev": "vite",
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "lint": "eslint .",
