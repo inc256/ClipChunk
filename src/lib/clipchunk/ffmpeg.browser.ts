@@ -1,7 +1,6 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import type { Overlay, VideoMeta, ChunkResult } from "./types";
-import workerUrl from "@ffmpeg/ffmpeg/worker?url";
 
 // Load the (large, ~25 MB) ffmpeg-core wasm/js from a CDN instead of via
 // Vite's `?url` asset pipeline. `@ffmpeg/core` is notoriously fragile to
@@ -31,6 +30,21 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
+/**
+ * Fetches a file and converts it to a blob URL with retry logic
+ */
+async function fetchWithRetry(url: string, type: string, retries = 3): Promise<string> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await toBlobURL(url, type);
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
+  throw new Error(`Failed to fetch ${url} after ${retries} retries`);
+}
+
 export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSignal): Promise<FFmpeg> {
   if (_ffmpeg) return _ffmpeg;
 
@@ -47,49 +61,98 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
   if (!_loadPromise) {
     _loadPromise = (async () => {
       const ff = new FFmpeg();
+      
       if (onLog) {
         ff.on("log", ({ message }) => {
           console.debug("[ffmpeg]", message);
           onLog(message);
         });
       }
+      
       try {
-        onLog?.("Fetching ffmpeg-core.js…");
+        onLog?.("📥 Fetching ffmpeg-core.js…");
         const coreURL = await withTimeout(
-          toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+          fetchWithRetry(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
           LOAD_TIMEOUT_MS,
           `Timed out fetching ffmpeg-core.js from ${CORE_BASE}. Check your ` +
             "network connection and that unpkg.com is reachable / not " +
             "blocked by an extension or CSP.",
         );
-        onLog?.("Fetching ffmpeg-core.wasm…");
+        
+        onLog?.("📥 Fetching ffmpeg-core.wasm…");
         const wasmURL = await withTimeout(
-          toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+          fetchWithRetry(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
           LOAD_TIMEOUT_MS,
           `Timed out fetching ffmpeg-core.wasm from ${CORE_BASE}. Check your ` +
             "network connection and that unpkg.com is reachable / not " +
             "blocked by an extension or CSP.",
         );
-        onLog?.("Starting ffmpeg core…");
+        
+        // Fetch the worker script from the same CDN
+        onLog?.("📥 Fetching worker script…");
+        let workerURL: string;
+        try {
+          workerURL = await withTimeout(
+            fetchWithRetry(`${CORE_BASE}/ffmpeg-core.worker.js`, "text/javascript"),
+            LOAD_TIMEOUT_MS,
+            `Timed out fetching worker script from ${CORE_BASE}`,
+          );
+          onLog?.("✅ Worker script fetched successfully");
+        } catch (workerErr) {
+          // Fallback: try alternative naming convention
+          onLog?.("⚠️ Could not fetch ffmpeg-core.worker.js, trying alternative names…");
+          try {
+            workerURL = await withTimeout(
+              fetchWithRetry(`${CORE_BASE}/worker.js`, "text/javascript"),
+              LOAD_TIMEOUT_MS,
+              "Timed out fetching alternative worker script",
+            );
+            onLog?.("✅ Alternative worker script fetched successfully");
+          } catch (fallbackErr) {
+            // If worker script can't be fetched, try to let FFmpeg handle it
+            onLog?.("⚠️ Could not fetch worker script, will let FFmpeg use default");
+            workerURL = undefined as any;
+          }
+        }
+        
+        onLog?.("🚀 Starting ffmpeg core…");
+        const loadOptions: any = {
+          coreURL,
+          wasmURL,
+        };
+        
+        // Only add workerURL if we successfully fetched it
+        if (workerURL) {
+          loadOptions.workerURL = workerURL;
+        }
+        
         await withTimeout(
-          ff.load({
-            coreURL,
-            wasmURL,
-            classWorkerURL: workerUrl,
-          }),
+          ff.load(loadOptions),
           LOAD_TIMEOUT_MS,
           "FFmpeg engine timed out while starting up after the core/wasm " +
             "were fetched successfully. This points at the worker script " +
             "(classWorkerURL) — check the Network tab for a failed/blocked " +
             "request to a *worker*.js file.",
         );
+        
+        onLog?.("✅ FFmpeg engine started successfully!");
       } catch (err) {
         // Reset so the next call can retry instead of permanently reusing a
         // rejected promise.
         _loadPromise = null;
         try { ff.terminate(); } catch { /* ignore */ }
+        
+        // Provide more detailed error information
+        if (err instanceof Error) {
+          onLog?.(`❌ FFmpeg load failed: ${err.message}`);
+          if (err.message.includes("worker")) {
+            onLog?.("💡 Tip: Check if your browser is blocking workers or if there's a CORS issue");
+            onLog?.("💡 Try opening the Network tab and looking for failed requests to *.worker.js files");
+          }
+        }
         throw err;
       }
+      
       _ffmpeg = ff;
       return ff;
     })();
@@ -158,6 +221,7 @@ export interface ProcessOpts {
  *  6. Parallel chunk writes replaced by sequential writes to avoid WASM OOM on
  *     large videos (WASM heap is limited to ~2 GB).
  *  7. Overlay files are written once before the chunk loop, not per chunk.
+ *  8. Enhanced error handling with detailed messages.
  */
 export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   const { video, overlays, chunkSeconds, onProgress, signal } = opts;
@@ -209,12 +273,24 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
 
   _logHandler = ({ message }) => {
     // Surface ffmpeg stderr lines without clobbering the percentage counter.
+    // Filter out noisy or expected warning messages
+    const ignorePatterns = [
+      /frame=.*fps=.*q=/i,  // FFmpeg progress output
+      /Past duration.*too large/i,
+      /buffer is too small/i,
+    ];
+    
+    const shouldIgnore = ignorePatterns.some(pattern => pattern.test(message));
+    if (shouldIgnore && !message.includes("error") && !message.includes("Error")) {
+      return;
+    }
+    
     try {
       onProgress({
         current: currentChunk,
         total,
         pct: 0,
-        label: message,
+        label: message.length > 100 ? message.substring(0, 100) + "..." : message,
       });
     } catch { /* ignore */ }
   };
@@ -231,6 +307,12 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
     const active = overlays.filter((o) => o.visible);
     for (let i = 0; i < active.length; i++) {
       const o = active[i];
+      onProgress({ 
+        current: 0, 
+        total, 
+        pct: 0, 
+        label: `Loading overlay ${i + 1}/${active.length}: ${o.file.name}` 
+      });
       await ff.writeFile(`ov${i}.png`, await fetchFile(o.file));
     }
 
@@ -347,8 +429,26 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           current: i + 1,
           total,
           pct: Math.round((i / total) * 100),
-          label: `Error on chunk ${i + 1}: ${msg}`,
+          label: `❌ Error on chunk ${i + 1}: ${msg.substring(0, 150)}`,
         });
+        
+        // Provide helpful tips based on common errors
+        if (msg.includes("memory") || msg.includes("alloc")) {
+          onProgress({
+            current: i + 1,
+            total,
+            pct: Math.round((i / total) * 100),
+            label: "💡 Tip: Try reducing chunk size or video resolution to avoid memory issues",
+          });
+        } else if (msg.includes("codec") || msg.includes("encoder")) {
+          onProgress({
+            current: i + 1,
+            total,
+            pct: Math.round((i / total) * 100),
+            label: "💡 Tip: Video codec may not be supported. Try using H.264 encoded videos.",
+          });
+        }
+        
         throw err;
       }
 
@@ -377,7 +477,7 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         current: i + 1,
         total,
         pct: Math.round(((i + 1) / total) * 100),
-        label: `Finished chunk ${i + 1} of ${total}`,
+        label: `✅ Finished chunk ${i + 1} of ${total}`,
       });
     } // end for (chunk loop)
 
@@ -398,7 +498,7 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
     // Detach live handlers so they don't fire during idle time. Skip if the
     // worker was terminated (terminateFFmpeg already cleared these globals
     // and `ff` is now a dead reference).
-    if (!aborted) {
+    if (!aborted && _ffmpeg === ff) {
       if (_logHandler) {
         try { ff.off("log", _logHandler); } catch { /* ignore */ }
         _logHandler = null;
