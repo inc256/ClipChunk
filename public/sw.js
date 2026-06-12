@@ -1,5 +1,9 @@
 /* ClipChunk service worker — minimal, NetworkFirst for HTML, CacheFirst for assets */
-const CACHE = "clipchunk-v1";
+
+// Bump this string on every deploy (or template it from your build hash).
+// The static "v1" name meant `activate` never had anything to clean up,
+// letting stale hashed chunks linger in cache across deploys.
+const CACHE = "clipchunk-v2";
 const PRECACHE = ["/", "/manifest.webmanifest", "/favicon.svg", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -50,7 +54,12 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Assets — cache first
+  // Assets — cache first, but never cache (or mask) a failed response.
+  // A 404 here is most likely a stale hashed chunk reference from an old
+  // bundle still running in the tab. We deliberately let the 404 propagate
+  // so the page's `vite:preloadError` handler can catch it and reload —
+  // serving the stale `cached` copy instead would mask the real error and
+  // potentially run mismatched old/new code together.
   event.respondWith(
     caches.match(req).then((cached) => {
       if (cached) return cached;
@@ -60,7 +69,7 @@ self.addEventListener("fetch", (event) => {
           caches.open(CACHE).then((c) => c.put(req, copy));
         }
         return res;
-      }).catch(() => cached);
+      }).catch(() => cached || Response.error());
     })
   );
 });
