@@ -1,9 +1,19 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile } from "@ffmpeg/util";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import type { Overlay, VideoMeta, ChunkResult } from "./types";
-import coreUrl from "@ffmpeg/core?url";
-import wasmUrl from "@ffmpeg/core/wasm?url";
 import workerUrl from "@ffmpeg/ffmpeg/worker?url";
+
+// Load the (large, ~25 MB) ffmpeg-core wasm/js from a CDN instead of via
+// Vite's `?url` asset pipeline. `@ffmpeg/core` is notoriously fragile to
+// bundle correctly — the previous local-asset approach produced URLs that
+// either 404'd or hung indefinitely inside `ff.load()` after a production
+// build. `toBlobURL` fetches each asset (regular CORS fetch, unaffected by
+// COEP) and converts it to a same-origin `blob:` URL, which the worker can
+// then load without any cross-origin restrictions.
+//
+// Pin an exact version for cache stability / reproducibility.
+const FFMPEG_CORE_VERSION = "0.12.6";
+const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
 
 let _ffmpeg: FFmpeg | null = null;
 let _loadPromise: Promise<FFmpeg> | null = null;
@@ -24,16 +34,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSignal): Promise<FFmpeg> {
   if (_ffmpeg) return _ffmpeg;
 
-  // ffmpeg.wasm's worker relies on SharedArrayBuffer, which browsers only
-  // expose when the page is cross-origin isolated (COOP + COEP headers).
-  // Without it, `ff.load()` can hang rather than throwing a clear error —
-  // fail fast here instead.
+  // `@ffmpeg/core` (single-threaded) does not require SharedArrayBuffer —
+  // only the `-mt` (multi-threaded) variant does, which needs COOP/COEP. We
+  // use the standard core via CDN below, so this is informational only.
   if (typeof SharedArrayBuffer === "undefined") {
-    throw new Error(
-      "This browser tab is not cross-origin isolated, so the video engine " +
-        "can't load. Make sure the site is served with " +
-        "Cross-Origin-Opener-Policy: same-origin and " +
-        "Cross-Origin-Embedder-Policy: require-corp, then reload the page.",
+    onLog?.(
+      "Note: SharedArrayBuffer is unavailable in this tab (no cross-origin " +
+        "isolation). This is fine for the single-threaded ffmpeg core.",
     );
   }
 
@@ -47,17 +54,34 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
         });
       }
       try {
+        onLog?.("Fetching ffmpeg-core.js…");
+        const coreURL = await withTimeout(
+          toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+          LOAD_TIMEOUT_MS,
+          `Timed out fetching ffmpeg-core.js from ${CORE_BASE}. Check your ` +
+            "network connection and that unpkg.com is reachable / not " +
+            "blocked by an extension or CSP.",
+        );
+        onLog?.("Fetching ffmpeg-core.wasm…");
+        const wasmURL = await withTimeout(
+          toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+          LOAD_TIMEOUT_MS,
+          `Timed out fetching ffmpeg-core.wasm from ${CORE_BASE}. Check your ` +
+            "network connection and that unpkg.com is reachable / not " +
+            "blocked by an extension or CSP.",
+        );
+        onLog?.("Starting ffmpeg core…");
         await withTimeout(
           ff.load({
-            coreURL: coreUrl,
-            wasmURL: wasmUrl,
+            coreURL,
+            wasmURL,
             classWorkerURL: workerUrl,
           }),
           LOAD_TIMEOUT_MS,
-          "FFmpeg engine timed out while loading. This usually means the page " +
-            "is not cross-origin isolated, or the core/wasm/worker assets " +
-            "404'd — check the Network tab for failed requests to *.wasm / " +
-            "*worker*.js files.",
+          "FFmpeg engine timed out while starting up after the core/wasm " +
+            "were fetched successfully. This points at the worker script " +
+            "(classWorkerURL) — check the Network tab for a failed/blocked " +
+            "request to a *worker*.js file.",
         );
       } catch (err) {
         // Reset so the next call can retry instead of permanently reusing a
