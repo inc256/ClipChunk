@@ -61,7 +61,7 @@ export function UploadZone({ onLoaded, onError }: { onLoaded: (m: VideoMeta) => 
       >
         {loading ? "Reading video…" : "Choose Video"}
       </button>
-      <p className="mt-6 text-xs text-muted-foreground">Supported: MP4 · MOV · MKV · WEBM</p>
+      <p className="mt-6 text-xs text-muted-foreground">Supporting: MP4 · MOV · MKV · WEBM</p>
       <input
         ref={inputRef}
         type="file"
