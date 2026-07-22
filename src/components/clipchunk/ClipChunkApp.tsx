@@ -5,7 +5,8 @@ import { ChunkSettings } from "./ChunkSettings";
 import { OverlayPanel } from "./OverlayPanel";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { ExportList } from "./ExportList";
-import type { ChunkResult, Overlay, VideoMeta } from "@/lib/clipchunk/types";
+import type { ChunkResult, Overlay, ReframeMode, VideoMeta } from "@/lib/clipchunk/types";
+import { getReframeGeometry } from "@/lib/clipchunk/reframe";
 
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -106,6 +107,7 @@ export function ClipChunkApp() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [unit, setUnit] = useState<"s" | "m">("s");
   const [chunkValue, setChunkValue] = useState(30);
+  const [reframeMode, setReframeMode] = useState<ReframeMode>("source");
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
   const [chunks, setChunks] = useState<ChunkResult[]>([]);
@@ -148,6 +150,10 @@ export function ClipChunkApp() {
     [overlays, selectedId],
   );
   const chunkSeconds = unit === "m" ? chunkValue * 60 : chunkValue;
+  const outputGeometry = useMemo(
+    () => (video ? getReframeGeometry(video.width, video.height, reframeMode) : null),
+    [video, reframeMode],
+  );
 
   // ── Derived chunk count for display ───────────────────────────────────────
   const estimatedChunks = video
@@ -252,6 +258,7 @@ export function ClipChunkApp() {
         video,
         overlays,
         chunkSeconds,
+        reframeMode,
         signal: controller.signal,
         onProgress: (p) => setProgress({ pct: p.pct, label: p.label }),
       });
@@ -289,6 +296,7 @@ export function ClipChunkApp() {
     setOverlays([]);
     setChunks([]);
     setSelectedId(null);
+    setReframeMode("source");
     setProgress(null);
     setError(null);
     setView("editor");
@@ -421,9 +429,18 @@ export function ClipChunkApp() {
               duration={video.duration}
               unit={unit}
               chunkValue={chunkValue}
+              reframeMode={reframeMode}
               onUnitChange={setUnit}
               onValueChange={setChunkValue}
+              onReframeModeChange={setReframeMode}
             />
+
+            {outputGeometry && (
+              <p className="rounded-lg border border-border/60 bg-background px-3 py-2 text-xs text-muted-foreground">
+                Output frame: <strong className="text-foreground">{outputGeometry.outputWidth} × {outputGeometry.outputHeight}</strong>
+                {reframeMode === "short" ? " (Centered 9:16 short-form)" : " (Matches source)"}
+              </p>
+            )}
 
             {/* Chunk preview count */}
             {estimatedChunks !== null && (
@@ -475,6 +492,7 @@ export function ClipChunkApp() {
               video={video}
               overlays={overlays}
               selectedId={selectedId}
+              reframeMode={reframeMode}
               onSelect={setSelectedId}
               onChange={patchOverlay}
             />

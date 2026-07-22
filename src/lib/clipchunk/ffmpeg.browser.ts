@@ -1,6 +1,7 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile } from "@ffmpeg/util";
-import type { Overlay, VideoMeta, ChunkResult } from "./types";
+import type { Overlay, VideoMeta, ChunkResult, ReframeMode } from "./types";
+import { getReframeGeometry } from "./reframe";
 
 const FFMPEG_CORE_VERSION = "0.12.10";
 const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
@@ -182,6 +183,7 @@ export interface ProcessOpts {
   video: VideoMeta;
   overlays: Overlay[];
   chunkSeconds: number;
+  reframeMode: ReframeMode;
   onProgress: (info: {
     current: number;
     total: number;
@@ -192,7 +194,7 @@ export interface ProcessOpts {
 }
 
 export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
-  const { video, overlays, chunkSeconds, onProgress, signal } = opts;
+  const { video, overlays, chunkSeconds, reframeMode, onProgress, signal } = opts;
 
   if (signal?.aborted) {
     throw new DOMException("Processing cancelled by user.", "AbortError");
@@ -295,7 +297,10 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
       for (let k = 0; k < active.length; k++) args.push("-i", `ov${k}.png`);
       args.push("-ss", start.toFixed(3), "-t", dur.toFixed(3));
 
-      if (active.length === 0) {
+      const output = getReframeGeometry(video.width, video.height, reframeMode);
+      const needsReframe = reframeMode === "short";
+
+      if (active.length === 0 && !needsReframe) {
         args.push(
           "-c:v", "libx264",
           "-preset", "ultrafast",
@@ -307,9 +312,18 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           outName,
         );
       } else {
-        const W = video.width;
-        const H = video.height;
+        const W = output.outputWidth;
+        const H = output.outputHeight;
         const filters: string[] = [];
+        let last = "[0:v]";
+
+        if (needsReframe) {
+          filters.push(
+            `[0:v]crop=${output.cropWidth}:${output.cropHeight}:${output.cropX}:${output.cropY},` +
+            `scale=${output.outputWidth}:${output.outputHeight}[base]`,
+          );
+          last = "[base]";
+        }
 
         const sorted = [...active]
           .map((o, idx) => ({ o, idx }))
@@ -320,25 +334,27 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           const th = Math.max(2, Math.round(o.h * H));
           const alpha = Math.max(0, Math.min(1, o.opacity));
           filters.push(
-            `[${idx + 1}:v]scale=${tw}:${th},` +
+            `[${idx + 1}:v]scale=${tw}:${th}:force_original_aspect_ratio=decrease,` +
+            `pad=${tw}:${th}:(ow-iw)/2:(oh-ih)/2:color=black@0,` +
             `format=rgba,` +
             `lutrgb=a='val*${alpha.toFixed(4)}'` +
             `[ov${n}]`,
           );
         });
 
-        let last = "[0:v]";
         sorted.forEach(({ o }, n) => {
           const x = Math.round(o.x * W);
           const y = Math.round(o.y * H);
-          const next = n === sorted.length - 1 ? "[vout]" : `[tmp${n}]`;
-          filters.push(`${last}[ov${n}]overlay=${x}:${y}[${next.slice(1, -1)}]`);
-          last = next;
+          const nextLabel = n === sorted.length - 1 ? "vout" : `tmp${n}`;
+          filters.push(`${last}[ov${n}]overlay=${x}:${y}[${nextLabel}]`);
+          last = `[${nextLabel}]`;
         });
+
+        const finalVideoLabel = active.length ? "[vout]" : last;
 
         args.push(
           "-filter_complex", filters.join(";"),
-          "-map", "[vout]",
+          "-map", finalVideoLabel,
           "-map", "0:a?",
           "-shortest",
           "-c:v", "libx264",

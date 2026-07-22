@@ -1,4 +1,5 @@
 export type Orientation = "Landscape" | "Portrait" | "Square";
+export type ReframeMode = "source" | "short";
 
 export interface VideoMeta {
   file: File;

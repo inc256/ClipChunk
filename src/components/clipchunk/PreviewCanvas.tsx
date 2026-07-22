@@ -1,22 +1,40 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Overlay, VideoMeta } from "@/lib/clipchunk/types";
+import type { Overlay, ReframeMode, VideoMeta } from "@/lib/clipchunk/types";
+import { getReframeGeometry } from "@/lib/clipchunk/reframe";
 
 interface Props {
   video: VideoMeta;
   overlays: Overlay[];
   selectedId: string | null;
+  reframeMode: ReframeMode;
   onSelect: (id: string | null) => void;
   onChange: (id: string, patch: Partial<Overlay>) => void;
 }
 
 type DragMode = "move" | "resize-br" | "rotate";
 
-export function PreviewCanvas({ video, overlays, selectedId, onSelect, onChange }: Props) {
+export function PreviewCanvas({ video, overlays, selectedId, reframeMode, onSelect, onChange }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
 
-  const aspect = video.width / video.height;
+  const output = useMemo(
+    () => getReframeGeometry(video.width, video.height, reframeMode),
+    [video.height, video.width, reframeMode],
+  );
+  const aspect = output.outputWidth / output.outputHeight;
+  const frameStyle: React.CSSProperties =
+    reframeMode === "short"
+      ? {
+          aspectRatio: `${output.outputWidth} / ${output.outputHeight}`,
+          width: "min(100%, calc(70vh * 9 / 16))",
+          maxHeight: "70vh",
+        }
+      : {
+          aspectRatio: `${output.outputWidth} / ${output.outputHeight}`,
+          width: "100%",
+          maxHeight: "70vh",
+        };
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -34,17 +52,26 @@ export function PreviewCanvas({ video, overlays, selectedId, onSelect, onChange 
   return (
     <div className="flex h-full w-full flex-col">
       <div className="flex items-center justify-between border-b border-border px-4 py-2 text-xs text-muted-foreground">
-        <span>Preview · {video.width}×{video.height} · {video.orientation}</span>
+        <span>
+          Preview · {output.outputWidth}×{output.outputHeight}
+          {reframeMode === "short" ? " · 9:16 auto-center" : ` · ${video.orientation}`}
+        </span>
         <span>{formatTime(video.duration)}</span>
       </div>
       <div className="flex flex-1 items-center justify-center p-3 sm:p-6">
         <div
           ref={wrapRef}
-          className="relative w-full overflow-hidden rounded-xl bg-black shadow-[0_30px_80px_-30px_rgba(0,0,0,0.7)] ring-1 ring-border"
-          style={{ aspectRatio: aspect, maxHeight: "70vh" }}
+          className="relative overflow-hidden rounded-xl bg-black shadow-[0_30px_80px_-30px_rgba(0,0,0,0.7)] ring-1 ring-border"
+          style={frameStyle}
           onMouseDown={(e) => { if (e.target === e.currentTarget) onSelect(null); }}
         >
-          <video ref={videoRef} src={video.url} className="h-full w-full" controls playsInline />
+          <video
+            ref={videoRef}
+            src={video.url}
+            className={`h-full w-full ${reframeMode === "short" ? "object-cover object-center" : "object-contain"}`}
+            controls
+            playsInline
+          />
           {/* Overlays */}
           {sortedOverlays.map((o) => (
             <OverlayBox
@@ -131,7 +158,7 @@ function OverlayBox({
       }}
       className={`group cursor-move select-none ${selected ? "outline outline-2 outline-primary" : "outline outline-1 outline-white/0 hover:outline-white/30"}`}
     >
-      <img src={overlay.src} alt={overlay.name} draggable={false} className="pointer-events-none h-full w-full object-fill" />
+      <img src={overlay.src} alt={overlay.name} draggable={false} className="pointer-events-none h-full w-full object-contain" />
       {selected && (
         <>
           <Handle pos="br" onDown={(e) => { e.stopPropagation(); setDrag({ mode: "resize-br", sx: e.clientX, sy: e.clientY, init: overlay }); }} />
