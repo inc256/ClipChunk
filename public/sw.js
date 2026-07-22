@@ -3,8 +3,24 @@
 // Bump this string on every deploy (or template it from your build hash).
 // The static "v1" name meant `activate` never had anything to clean up,
 // letting stale hashed chunks linger in cache across deploys.
-const CACHE = "clipchunk-v2";
+const CACHE = "clipchunk-v3";
 const PRECACHE = ["/", "/manifest.webmanifest", "/favicon.svg", "/icon-192.png", "/icon-512.png"];
+
+function isFfmpegAsset(url) {
+  return url.pathname.startsWith("/ffmpeg/");
+}
+
+function isUnexpectedHtmlResponse(res) {
+  const type = (res.headers.get("content-type") || "").toLowerCase();
+  return type.includes("text/html");
+}
+
+function isExpectedFfmpegType(url, res) {
+  const type = (res.headers.get("content-type") || "").toLowerCase();
+  if (url.pathname.endsWith(".wasm")) return type.includes("wasm") || type.includes("octet-stream");
+  if (url.pathname.endsWith(".js")) return type.includes("javascript") || type.includes("ecmascript") || type.includes("text/plain");
+  return true;
+}
 
 self.addEventListener("install", (e) => {
   e.waitUntil(
@@ -42,6 +58,13 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin && !url.hostname.includes("unpkg.com")) return;
 
+  // FFmpeg runtime files are fixed filenames (non-hashed) and must never be served stale.
+  // Use network-only behavior and avoid SW cache for these assets.
+  if (isFfmpegAsset(url)) {
+    event.respondWith(fetch(req));
+    return;
+  }
+
   // HTML — network first
   if (req.mode === "navigate" || req.headers.get("accept")?.includes("text/html")) {
     event.respondWith(
@@ -63,6 +86,7 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(
     caches.match(req).then((cached) => {
       if (cached) return cached;
+
       return fetch(req).then((res) => {
         if (res.ok && (res.type === "basic" || res.type === "cors")) {
           const copy = res.clone();

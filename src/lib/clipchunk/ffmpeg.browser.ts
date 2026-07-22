@@ -1,16 +1,17 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import { fetchFile } from "@ffmpeg/util";
 import type { Overlay, VideoMeta, ChunkResult } from "./types";
 
-const FFMPEG_CORE_VERSION = "0.12.6";
+const FFMPEG_CORE_VERSION = "0.12.10";
 const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
 
 let _ffmpeg: FFmpeg | null = null;
 let _loadPromise: Promise<FFmpeg> | null = null;
 let _logHandler: ((e: { message: string }) => void) | null = null;
 let _progressHandler: ((e: { progress: number; time: number }) => void) | null = null;
+let _runtimeObjectURLs: string[] = [];
 
-const LOAD_TIMEOUT_MS = 30_000;
+const LOAD_TIMEOUT_MS = 60_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -21,15 +22,14 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
-/**
- * Fetches a file and converts it to a blob URL with retry logic
- */
 async function fetchWithRetry(url: string, type: string, retries = 3): Promise<string> {
   for (let i = 0; i < retries; i++) {
     try {
       const response = await fetch(url);
       if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      return await toBlobURL(url, type);
+      const blob = await response.blob();
+      const typedBlob = blob.type === type ? blob : new Blob([blob], { type });
+      return URL.createObjectURL(typedBlob);
     } catch (err) {
       if (i === retries - 1) throw err;
       console.log(`Retry ${i + 1}/${retries} for ${url}`);
@@ -39,17 +39,50 @@ async function fetchWithRetry(url: string, type: string, retries = 3): Promise<s
   throw new Error(`Failed to fetch ${url} after ${retries} retries`);
 }
 
-/**
- * Get worker URL - uses local file for production, CDN for development
- */
-function getWorkerURL(): string {
-  // In production (Vercel), use the local file from public directory
-  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
-    return '/ffmpeg/ffmpeg-core.worker.js';
+function withBase(path: string): string {
+  const base = import.meta.env.BASE_URL || "/";
+  const normalizedBase = base.endsWith("/") ? base : `${base}/`;
+  return `${normalizedBase}${path}`;
+}
+
+async function resolveCoreAssetURL(
+  localPath: string,
+  kind: "js" | "wasm",
+  onLog?: (m: string) => void,
+): Promise<string> {
+  const localURL = withBase(localPath);
+
+  try {
+    const response = await fetch(localURL, { method: "GET" });
+    const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+    const looksLikeHtml = contentType.includes("text/html");
+    const typeOk = kind === "js"
+      ? /javascript|ecmascript|text\/plain/.test(contentType)
+      : /wasm|octet-stream/.test(contentType);
+
+    if (response.ok && !looksLikeHtml && typeOk) {
+      if (kind === "js") {
+        // Module workers in Vite dev cannot import files from /public directly.
+        // Serve core JS via blob URL to bypass source import transforms.
+        const sourceText = await response.text();
+        if (!sourceText.includes("createFFmpegCore")) {
+          throw new Error(`ffmpeg-core.js payload is invalid at ${localURL}`);
+        }
+        const coreBlobURL = URL.createObjectURL(new Blob([sourceText], { type: "text/javascript" }));
+        _runtimeObjectURLs.push(coreBlobURL);
+        onLog?.(`Using local ffmpeg ${kind} via blob URL.`);
+        return coreBlobURL;
+      }
+
+      onLog?.(`Using local ffmpeg ${kind}: ${localURL}`);
+      return localURL;
+    }
+    onLog?.(`Local ffmpeg ${kind} unavailable (${response.status}, ${contentType || "unknown"}).`);
+  } catch {
+    onLog?.(`Local ffmpeg ${kind} check failed.`);
   }
-  
-  // In development, we can try CDN but with fallback
-  return `${CORE_BASE}/ffmpeg-core.worker.js`;
+
+  throw new Error(`Missing or invalid local ffmpeg ${kind} at ${localURL}`);
 }
 
 export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSignal): Promise<FFmpeg> {
@@ -74,44 +107,23 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
       }
       
       try {
-        onLog?.("📥 Fetching ffmpeg-core.js…");
         const coreURL = await withTimeout(
-          fetchWithRetry(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+          resolveCoreAssetURL("ffmpeg/ffmpeg-core.js", "js", onLog),
           LOAD_TIMEOUT_MS,
-          `Timed out fetching ffmpeg-core.js`,
+          "Timed out resolving ffmpeg-core.js",
         );
         
-        onLog?.("📥 Fetching ffmpeg-core.wasm…");
         const wasmURL = await withTimeout(
-          fetchWithRetry(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+          resolveCoreAssetURL("ffmpeg/ffmpeg-core.wasm", "wasm", onLog),
           LOAD_TIMEOUT_MS,
-          `Timed out fetching ffmpeg-core.wasm`,
+          "Timed out resolving ffmpeg-core.wasm",
         );
-        
-        // Use local worker file instead of CDN to avoid CORS
-        const workerURL = getWorkerURL();
-        onLog?.(`📥 Using worker from: ${workerURL}`);
-        
-        // Verify worker file exists before attempting to load
-        if (workerURL.startsWith('/')) {
-          try {
-            const response = await fetch(workerURL, { method: 'HEAD' });
-            if (!response.ok) {
-              throw new Error(`Worker file not found at ${workerURL} (HTTP ${response.status})`);
-            }
-            onLog?.("✅ Worker file verified");
-          } catch (err) {
-            onLog?.(`⚠️ Could not verify worker file: ${err instanceof Error ? err.message : 'Unknown error'}`);
-            // Continue anyway - let FFmpeg try to load it
-          }
-        }
         
         onLog?.("🚀 Starting ffmpeg core…");
         await withTimeout(
           ff.load({
             coreURL,
             wasmURL,
-            workerURL, // Use local worker file
           }),
           LOAD_TIMEOUT_MS,
           "FFmpeg engine timed out while starting up",
@@ -124,12 +136,7 @@ export async function getFFmpeg(onLog?: (m: string) => void, signal?: AbortSigna
         
         if (err instanceof Error) {
           onLog?.(`❌ FFmpeg load failed: ${err.message}`);
-          
-          // Provide specific help for worker-related errors
-          if (err.message.includes("worker") || err.message.includes("Worker")) {
-            onLog?.("💡 Tip: Worker file missing. Make sure you've run 'npm run prebuild' to copy the worker file.");
-            onLog?.("💡 Check that /public/ffmpeg/ffmpeg-core.worker.js exists in your build output.");
-          }
+          onLog?.("💡 Ensure '/ffmpeg/ffmpeg-core.js' and '/ffmpeg/ffmpeg-core.wasm' are deployed as real files (not HTML fallbacks).");
         }
         throw err;
       }
@@ -161,6 +168,10 @@ export function terminateFFmpeg() {
   if (_ffmpeg) {
     try { _ffmpeg.terminate(); } catch { /* ignore */ }
   }
+  for (const url of _runtimeObjectURLs) {
+    try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+  }
+  _runtimeObjectURLs = [];
   _ffmpeg = null;
   _loadPromise = null;
   _logHandler = null;

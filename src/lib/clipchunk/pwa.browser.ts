@@ -3,6 +3,8 @@ export type InstallPromptEvent = Event & {
   userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
 };
 
+const ENABLE_SERVICE_WORKER = false;
+
 export function isInIframe(): boolean {
   try { return window.self !== window.top; } catch { return true; }
 }
@@ -15,6 +17,14 @@ export function isPreviewHost(): boolean {
 export function registerServiceWorker(onReady: () => void) {
   if (typeof window === "undefined") return;
   if (!("serviceWorker" in navigator)) return;
+
+  if (!ENABLE_SERVICE_WORKER) {
+    navigator.serviceWorker.getRegistrations?.().then((registrations) => {
+      registrations.forEach((registration) => registration.unregister());
+    });
+    return;
+  }
+
   // Avoid SW in iframes/preview hosts
   if (isInIframe() || isPreviewHost()) {
     navigator.serviceWorker.getRegistrations?.().then((rs) => rs.forEach((r) => r.unregister()));
