@@ -101,6 +101,7 @@ function ProgressBar({ pct, label, onCancel }: ProgressBarProps) {
 
 export function ClipChunkApp() {
   const [video, setVideo] = useState<VideoMeta | null>(null);
+  const [view, setView] = useState<"editor" | "export">("editor");
   const [overlays, setOverlays] = useState<Overlay[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [unit, setUnit] = useState<"s" | "m">("s");
@@ -255,6 +256,7 @@ export function ClipChunkApp() {
         onProgress: (p) => setProgress({ pct: p.pct, label: p.label }),
       });
       setChunks(out);
+      setView("export");
       setProgress({ pct: 100, label: `Done — ${out.length} chunk${out.length !== 1 ? "s" : ""} ready` });
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
@@ -289,6 +291,7 @@ export function ClipChunkApp() {
     setSelectedId(null);
     setProgress(null);
     setError(null);
+    setView("editor");
   }
 
   // ── PWA install ────────────────────────────────────────────────────────────
@@ -376,6 +379,39 @@ export function ClipChunkApp() {
             )}
           </div>
         </main>
+      ) : view === "export" && chunks.length > 0 ? (
+        <main className="flex flex-1 flex-col gap-4 px-4 py-6 sm:px-6">
+          <section className="rounded-xl border border-border bg-card p-4 sm:p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">Export Ready</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {chunks.length} chunk{chunks.length !== 1 ? "s" : ""} generated from {video.name}.
+                </p>
+              </div>
+              <button
+                onClick={() => setView("editor")}
+                className="rounded-lg border border-border bg-surface px-3 py-2 text-xs font-semibold hover:border-primary/40"
+              >
+                Back to Editor
+              </button>
+            </div>
+          </section>
+
+          <ExportList
+            chunks={chunks}
+            onDelete={(id) => {
+              setChunks((prev) => {
+                const next = prev.filter((c) => c.id !== id);
+                if (next.length === 0) {
+                  setView("editor");
+                }
+                return next;
+              });
+            }}
+            onReset={resetProject}
+          />
+        </main>
       ) : (
         <main className="grid flex-1 grid-cols-1 lg:grid-cols-[320px_1fr_320px]">
           {/* ── Left panel ── */}
@@ -454,24 +490,29 @@ export function ClipChunkApp() {
             />
           </aside>
 
-          {/* ── Bottom: progress + export ── */}
-          {(processing || progress || chunks.length > 0) && (
+          {/* ── Bottom: non-blocking status ── */}
+          {progress && !processing && chunks.length === 0 && (
             <div className="order-4 col-span-full space-y-4 border-t border-border bg-secondary/30 p-4">
-              {(processing || (progress && chunks.length === 0)) && progress && (
-                <ProgressBar
-                  pct={progress.pct}
-                  label={progress.label}
-                  onCancel={processing ? cancelProcessing : undefined}
-                />
-              )}
-              <ExportList
-                chunks={chunks}
-                onDelete={(id) => setChunks((prev) => prev.filter((c) => c.id !== id))}
-                onReset={resetProject}
+              <ProgressBar
+                pct={progress.pct}
+                label={progress.label}
               />
             </div>
           )}
         </main>
+      )}
+
+      {/* ── Floating processing card ── */}
+      {processing && progress && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-background/45 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md">
+            <ProgressBar
+              pct={progress.pct}
+              label={progress.label}
+              onCancel={cancelProcessing}
+            />
+          </div>
+        </div>
       )}
     </div>
   );
