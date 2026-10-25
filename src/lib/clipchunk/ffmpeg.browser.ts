@@ -183,6 +183,7 @@ export interface ProcessOpts {
   video: VideoMeta;
   overlays: Overlay[];
   chunkSeconds: number;
+  chunkIndex?: number;
   reframeMode: ReframeMode;
   onProgress: (info: {
     current: number;
@@ -194,11 +195,24 @@ export interface ProcessOpts {
 }
 
 export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
-  const { video, overlays, chunkSeconds, reframeMode, onProgress, signal } = opts;
+  const { video, overlays, chunkSeconds, chunkIndex, reframeMode, onProgress, signal } = opts;
 
   if (signal?.aborted) {
     throw new DOMException("Processing cancelled by user.", "AbortError");
   }
+
+  const chunkCount = Math.max(1, Math.ceil(video.duration / chunkSeconds));
+  if (
+    chunkIndex !== undefined &&
+    (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= chunkCount)
+  ) {
+    throw new RangeError(`Chunk index must be between 0 and ${chunkCount - 1}.`);
+  }
+  const chunkIndices =
+    chunkIndex === undefined
+      ? Array.from({ length: chunkCount }, (_, index) => index)
+      : [chunkIndex];
+  const total = chunkIndices.length;
 
   const ff = await getFFmpeg(
     (message) => onProgress({ current: 0, total: 1, pct: 0, label: message }),
@@ -219,17 +233,17 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
     try { ff.off("progress", _progressHandler); } catch { /* ignore */ }
   }
 
-  const total = Math.max(1, Math.ceil(video.duration / chunkSeconds));
   let currentChunk = 0;
 
   _progressHandler = ({ progress }) => {
     const ratio = Math.max(0, Math.min(1, progress));
     const overallPct = Math.round(((currentChunk + ratio) / total) * 100);
+    const sourceChunkNumber = chunkIndices[currentChunk] + 1;
     onProgress({
       current: currentChunk + ratio,
       total,
       pct: overallPct,
-      label: `Processing chunk ${currentChunk + 1} of ${total} (${Math.round(ratio * 100)}%)`,
+      label: `Processing chunk ${sourceChunkNumber} of ${chunkCount} (${Math.round(ratio * 100)}%)`,
     });
   };
 
@@ -276,21 +290,22 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
 
     const results: ChunkResult[] = [];
 
-    for (let i = 0; i < total; i++) {
+    for (let position = 0; position < total; position++) {
       if (aborted || signal?.aborted) {
         throw new DOMException("Processing cancelled by user.", "AbortError");
       }
 
-      currentChunk = i;
+      const i = chunkIndices[position];
+      currentChunk = position;
       const start = i * chunkSeconds;
       const dur = Math.min(chunkSeconds, video.duration - start);
       const outName = `chunk_${String(i + 1).padStart(3, "0")}.mp4`;
 
       onProgress({
-        current: i,
+        current: position,
         total,
-        pct: Math.round((i / total) * 100),
-        label: `Processing chunk ${i + 1} of ${total}…`,
+        pct: Math.round((position / total) * 100),
+        label: `Processing chunk ${i + 1} of ${chunkCount}…`,
       });
 
       const args: string[] = ["-i", "input.mp4"];
@@ -303,8 +318,8 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
       if (active.length === 0 && !needsReframe) {
         args.push(
           "-c:v", "libx264",
-          "-preset", "ultrafast",
-          "-crf", "23",
+          "-preset", "veryfast",
+          "-crf", "26",
           "-pix_fmt", "yuv420p",
           "-c:a", "aac",
           "-b:a", "128k",
@@ -358,8 +373,8 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
           "-map", "0:a?",
           "-shortest",
           "-c:v", "libx264",
-          "-preset", "ultrafast",
-          "-crf", "23",
+          "-preset", "veryfast",
+          "-crf", "26",
           "-pix_fmt", "yuv420p",
           "-c:a", "aac",
           "-b:a", "128k",
@@ -376,9 +391,9 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         }
         const msg = err instanceof Error ? err.message : String(err);
         onProgress({
-          current: i + 1,
+          current: position + 1,
           total,
-          pct: Math.round((i / total) * 100),
+          pct: Math.round((position / total) * 100),
           label: `❌ Error on chunk ${i + 1}: ${msg.substring(0, 150)}`,
         });
         throw err;
@@ -403,10 +418,10 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
       try { await ff.deleteFile(outName); } catch { /* ignore */ }
 
       onProgress({
-        current: i + 1,
+        current: position + 1,
         total,
-        pct: Math.round(((i + 1) / total) * 100),
-        label: `✅ Finished chunk ${i + 1} of ${total}`,
+        pct: Math.round(((position + 1) / total) * 100),
+        label: `✅ Finished chunk ${i + 1} of ${chunkCount}`,
       });
     }
 

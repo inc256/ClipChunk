@@ -2,14 +2,19 @@ import { useMemo } from "react";
 import type { ReframeMode } from "@/lib/clipchunk/types";
 
 export function ChunkSettings({
-  duration, unit, chunkValue, reframeMode, onUnitChange, onValueChange, onReframeModeChange,
+  duration, unit, chunkValue, chunkMode, selectedChunk, reframeMode,
+  onUnitChange, onValueChange, onChunkModeChange, onSelectedChunkChange, onReframeModeChange,
 }: {
   duration: number;
   unit: "s" | "m";
   chunkValue: number;
+  chunkMode: "all" | "single";
+  selectedChunk: number;
   reframeMode: ReframeMode;
   onUnitChange: (u: "s" | "m") => void;
   onValueChange: (n: number) => void;
+  onChunkModeChange: (mode: "all" | "single") => void;
+  onSelectedChunkChange: (n: number) => void;
   onReframeModeChange: (mode: ReframeMode) => void;
 }) {
   const seconds = unit === "m" ? chunkValue * 60 : chunkValue;
@@ -53,6 +58,35 @@ export function ChunkSettings({
       <p className="mt-4 text-xs text-muted-foreground">
         Estimated Chunks: <span className="font-semibold text-foreground">{estimated}</span>
       </p>
+      <div className="mt-3">
+        <label className="block text-sm font-medium">Chunks to export</label>
+        <div className="mt-2 inline-flex overflow-hidden rounded-lg border border-input">
+          {(["all", "single"] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => onChunkModeChange(mode)}
+              className={`px-3 py-2 text-xs font-semibold transition ${chunkMode === mode ? "bg-primary text-primary-foreground" : "bg-surface text-muted-foreground hover:text-foreground"}`}
+            >
+              {mode === "all" ? "All chunks" : "One chunk"}
+            </button>
+          ))}
+        </div>
+        {chunkMode === "single" && (
+          <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+            Chunk number
+            <input
+              type="number"
+              min={1}
+              max={estimated}
+              value={selectedChunk}
+              onChange={(e) => onSelectedChunkChange(Math.max(1, Math.min(estimated, Number(e.target.value) || 1)))}
+              className="w-20 rounded-lg border border-input bg-surface px-2 py-1.5 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/30"
+            />
+            <span>of {estimated}</span>
+          </label>
+        )}
+      </div>
 
       <div className="mt-5 border-t border-border pt-4">
         <label className="block text-sm font-medium">Short-Form Reframe</label>

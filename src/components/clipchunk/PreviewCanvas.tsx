@@ -32,7 +32,7 @@ export function PreviewCanvas({ video, overlays, selectedId, reframeMode, onSele
         }
       : {
           aspectRatio: `${output.outputWidth} / ${output.outputHeight}`,
-          width: "100%",
+          width: `min(100%, calc(70vh * ${aspect}))`,
           maxHeight: "70vh",
         };
 

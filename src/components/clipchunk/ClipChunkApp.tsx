@@ -68,30 +68,33 @@ interface ProgressBarProps {
 
 function ProgressBar({ pct, label, onCancel }: ProgressBarProps) {
   return (
-    <div className="rounded-xl border border-border bg-card p-4">
-      <div className="mb-2 flex items-center justify-between gap-3 text-sm">
-        <span className="min-w-0 flex-1 truncate font-medium" title={label}>
-          {label}
-        </span>
+    <div className="cc-export-progress rounded-xl border border-border bg-card p-4 shadow-[0_12px_36px_rgba(0,0,0,0.18)]">
+      <div className="mb-3 flex items-center justify-between gap-3 text-sm">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="inline-block h-2.5 w-2.5 rounded-full bg-primary shadow-[0_0_0_6px_rgba(34,197,94,0.18)]" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate font-medium" title={label}>
+            {label}
+          </span>
+        </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="tabular-nums text-muted-foreground">{pct}%</span>
+          <span className="tabular-nums text-sm font-semibold text-primary">{pct}%</span>
           {onCancel && (
             <button
               onClick={onCancel}
-              className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground transition hover:border-destructive hover:text-destructive"
+              className="rounded-md border border-border px-2 py-0.5 text-[11px] font-medium text-muted-foreground transition hover:border-destructive hover:text-destructive"
             >
               Cancel
             </button>
           )}
         </div>
       </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-surface">
+      <div className="cc-export-track h-3 w-full overflow-hidden rounded-full bg-surface">
         <div
-          className="h-full bg-primary transition-all duration-300"
+          className="cc-export-bar h-full rounded-full transition-[width] duration-300"
           style={{ width: `${pct}%` }}
         />
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-3 text-xs text-muted-foreground">
         All processing runs locally with FFmpeg.wasm — your video never leaves the device.
       </p>
     </div>
@@ -107,6 +110,8 @@ export function ClipChunkApp() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [unit, setUnit] = useState<"s" | "m">("s");
   const [chunkValue, setChunkValue] = useState(30);
+  const [chunkMode, setChunkMode] = useState<"all" | "single">("all");
+  const [selectedChunk, setSelectedChunk] = useState(1);
   const [reframeMode, setReframeMode] = useState<ReframeMode>("source");
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
@@ -159,6 +164,7 @@ export function ClipChunkApp() {
   const estimatedChunks = video
     ? Math.max(1, Math.ceil(video.duration / chunkSeconds))
     : null;
+  const activeChunkNumber = Math.min(selectedChunk, estimatedChunks ?? 1);
 
   // ── Overlay helpers ────────────────────────────────────────────────────────
 
@@ -258,6 +264,7 @@ export function ClipChunkApp() {
         video,
         overlays,
         chunkSeconds,
+        chunkIndex: chunkMode === "single" ? activeChunkNumber - 1 : undefined,
         reframeMode,
         signal: controller.signal,
         onProgress: (p) => setProgress({ pct: p.pct, label: p.label }),
@@ -429,9 +436,13 @@ export function ClipChunkApp() {
               duration={video.duration}
               unit={unit}
               chunkValue={chunkValue}
+              chunkMode={chunkMode}
+              selectedChunk={activeChunkNumber}
               reframeMode={reframeMode}
               onUnitChange={setUnit}
               onValueChange={setChunkValue}
+              onChunkModeChange={setChunkMode}
+              onSelectedChunkChange={setSelectedChunk}
               onReframeModeChange={setReframeMode}
             />
 
@@ -445,9 +456,11 @@ export function ClipChunkApp() {
             {/* Chunk preview count */}
             {estimatedChunks !== null && (
               <p className="rounded-lg bg-primary/5 px-3 py-2 text-xs text-primary">
-                This will produce{" "}
-                <strong>{estimatedChunks}</strong>{" "}
-                chunk{estimatedChunks !== 1 ? "s" : ""}.
+                {chunkMode === "single" ? (
+                  <>This will produce chunk <strong>{activeChunkNumber}</strong> of <strong>{estimatedChunks}</strong>.</>
+                ) : (
+                  <>This will produce <strong>{estimatedChunks}</strong> chunk{estimatedChunks !== 1 ? "s" : ""}.</>
+                )}
               </p>
             )}
 
@@ -475,7 +488,7 @@ export function ClipChunkApp() {
                 disabled={processing}
                 className="w-full rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow-sm transition hover:brightness-110 active:scale-[.99] disabled:opacity-60"
               >
-                Generate Chunks
+                {chunkMode === "single" ? `Generate Chunk ${activeChunkNumber}` : "Generate Chunks"}
               </button>
             )}
 
