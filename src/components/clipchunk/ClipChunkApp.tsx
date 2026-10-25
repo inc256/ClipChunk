@@ -1,12 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { UploadZone } from "./UploadZone";
 import { PreviewCanvas } from "./PreviewCanvas";
 import { ChunkSettings } from "./ChunkSettings";
 import { OverlayPanel } from "./OverlayPanel";
-import { PropertiesPanel } from "./PropertiesPanel";
 import { ExportList } from "./ExportList";
 import type { ChunkResult, Overlay, ReframeMode, VideoMeta } from "@/lib/clipchunk/types";
-import { getReframeGeometry } from "@/lib/clipchunk/reframe";
 
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -88,14 +86,21 @@ function ProgressBar({ pct, label, onCancel }: ProgressBarProps) {
           )}
         </div>
       </div>
-      <div className="cc-export-track h-3 w-full overflow-hidden rounded-full bg-surface">
+      <div
+        className="cc-export-track h-3 w-full overflow-hidden rounded-full bg-surface"
+        role="progressbar"
+        aria-label="Export progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+      >
         <div
           className="cc-export-bar h-full rounded-full transition-[width] duration-300"
           style={{ width: `${pct}%` }}
         />
       </div>
       <p className="mt-3 text-xs text-muted-foreground">
-        All processing runs locally with FFmpeg.wasm — your video never leaves the device.
+        Your video stays on this device and is never uploaded.
       </p>
     </div>
   );
@@ -150,16 +155,7 @@ export function ClipChunkApp() {
     return () => cleanup();
   }, []);
 
-  const selected = useMemo(
-    () => overlays.find((o) => o.id === selectedId) ?? null,
-    [overlays, selectedId],
-  );
   const chunkSeconds = unit === "m" ? chunkValue * 60 : chunkValue;
-  const outputGeometry = useMemo(
-    () => (video ? getReframeGeometry(video.width, video.height, reframeMode) : null),
-    [video, reframeMode],
-  );
-
   // ── Derived chunk count for display ───────────────────────────────────────
   const estimatedChunks = video
     ? Math.max(1, Math.ceil(video.duration / chunkSeconds))
@@ -253,7 +249,7 @@ export function ClipChunkApp() {
     setError(null);
     setChunks([]);
     setProcessing(true);
-    setProgress({ pct: 0, label: "Loading engine…" });
+    setProgress({ pct: 0, label: "Getting your export ready…" });
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -428,12 +424,13 @@ export function ClipChunkApp() {
           />
         </main>
       ) : (
-        <main className="grid flex-1 grid-cols-1 lg:grid-cols-[320px_1fr_320px]">
+        <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(280px,320px)_minmax(0,1fr)]">
           {/* ── Left panel ── */}
           <aside className="order-2 space-y-4 border-border bg-secondary/40 p-4 lg:order-1 lg:border-r">
             <FileInfo video={video} />
             <ChunkSettings
               duration={video.duration}
+              lossless={reframeMode === "source" && !overlays.some((overlay) => overlay.visible)}
               unit={unit}
               chunkValue={chunkValue}
               chunkMode={chunkMode}
@@ -445,13 +442,6 @@ export function ClipChunkApp() {
               onSelectedChunkChange={setSelectedChunk}
               onReframeModeChange={setReframeMode}
             />
-
-            {outputGeometry && (
-              <p className="rounded-lg border border-border/60 bg-background px-3 py-2 text-xs text-muted-foreground">
-                Output frame: <strong className="text-foreground">{outputGeometry.outputWidth} × {outputGeometry.outputHeight}</strong>
-                {reframeMode === "short" ? " (Centered 9:16 short-form)" : " (Matches source)"}
-              </p>
-            )}
 
             {/* Chunk preview count */}
             {estimatedChunks !== null && (
@@ -472,6 +462,8 @@ export function ClipChunkApp() {
               onPatch={patchOverlay}
               onDelete={remove}
               onDuplicate={duplicate}
+              onBringForward={() => selectedId && reorder(selectedId, 1)}
+              onSendBackward={() => selectedId && reorder(selectedId, -1)}
             />
 
             {/* Generate / Cancel */}
@@ -500,7 +492,7 @@ export function ClipChunkApp() {
           </aside>
 
           {/* ── Centre preview ── */}
-          <section className="order-1 min-h-[40vh] border-border bg-background lg:order-2">
+          <section className="order-1 min-h-[55vh] border-border bg-background lg:min-h-0">
             <PreviewCanvas
               video={video}
               overlays={overlays}
@@ -510,16 +502,6 @@ export function ClipChunkApp() {
               onChange={patchOverlay}
             />
           </section>
-
-          {/* ── Right properties panel ── */}
-          <aside className="order-3 space-y-4 border-border bg-secondary/40 p-4 lg:border-l">
-            <PropertiesPanel
-              overlay={selected}
-              onPatch={(p) => selected && patchOverlay(selected.id, p)}
-              onBringForward={() => selected && reorder(selected.id, 1)}
-              onSendBackward={() => selected && reorder(selected.id, -1)}
-            />
-          </aside>
 
           {/* ── Bottom: non-blocking status ── */}
           {progress && !processing && chunks.length === 0 && (

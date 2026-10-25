@@ -2,10 +2,11 @@ import { useMemo } from "react";
 import type { ReframeMode } from "@/lib/clipchunk/types";
 
 export function ChunkSettings({
-  duration, unit, chunkValue, chunkMode, selectedChunk, reframeMode,
+  duration, lossless, unit, chunkValue, chunkMode, selectedChunk, reframeMode,
   onUnitChange, onValueChange, onChunkModeChange, onSelectedChunkChange, onReframeModeChange,
 }: {
   duration: number;
+  lossless: boolean;
   unit: "s" | "m";
   chunkValue: number;
   chunkMode: "all" | "single";
@@ -108,6 +109,11 @@ export function ChunkSettings({
           </button>
         </div>
       </div>
+      <p className="mt-4 rounded-lg border border-border/60 bg-background px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+        {lossless
+          ? "Original video and audio are copied without re-encoding. Chunk boundaries align to source keyframes, so durations may vary slightly."
+          : "Overlays or reframing require re-encoding, which can change the output size and quality."}
+      </p>
     </section>
   );
 }

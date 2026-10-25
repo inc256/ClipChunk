@@ -61,14 +61,14 @@ export function PreviewCanvas({ video, overlays, selectedId, reframeMode, onSele
       <div className="flex flex-1 items-center justify-center p-3 sm:p-6">
         <div
           ref={wrapRef}
-          className="relative overflow-hidden rounded-xl bg-black shadow-[0_30px_80px_-30px_rgba(0,0,0,0.7)] ring-1 ring-border"
+          className="relative overflow-hidden rounded-xl bg-background shadow-[0_30px_80px_-30px_rgba(0,0,0,0.7)] ring-1 ring-border"
           style={frameStyle}
           onMouseDown={(e) => { if (e.target === e.currentTarget) onSelect(null); }}
         >
           <video
             ref={videoRef}
             src={video.url}
-            className={`h-full w-full ${reframeMode === "short" ? "object-cover object-center" : "object-contain"}`}
+            className="h-full w-full object-cover object-center"
             controls
             playsInline
           />

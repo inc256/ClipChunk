@@ -8,7 +8,6 @@ const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/um
 
 let _ffmpeg: FFmpeg | null = null;
 let _loadPromise: Promise<FFmpeg> | null = null;
-let _logHandler: ((e: { message: string }) => void) | null = null;
 let _progressHandler: ((e: { progress: number; time: number }) => void) | null = null;
 let _runtimeObjectURLs: string[] = [];
 
@@ -175,8 +174,27 @@ export function terminateFFmpeg() {
   _runtimeObjectURLs = [];
   _ffmpeg = null;
   _loadPromise = null;
-  _logHandler = null;
   _progressHandler = null;
+}
+
+function getSourceContainer(fileName: string): {
+  extension: string;
+  format: string;
+  mimeType: string;
+} {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  switch (extension) {
+    case "mp4":
+      return { extension, format: "mp4", mimeType: "video/mp4" };
+    case "mov":
+      return { extension, format: "mov", mimeType: "video/quicktime" };
+    case "mkv":
+      return { extension, format: "matroska", mimeType: "video/x-matroska" };
+    case "webm":
+      return { extension, format: "webm", mimeType: "video/webm" };
+    default:
+      throw new Error(`Cannot losslessly split unsupported video container: ${extension ?? "unknown"}.`);
+  }
 }
 
 export interface ProcessOpts {
@@ -214,10 +232,8 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
       : [chunkIndex];
   const total = chunkIndices.length;
 
-  const ff = await getFFmpeg(
-    (message) => onProgress({ current: 0, total: 1, pct: 0, label: message }),
-    signal,
-  );
+  onProgress({ current: 0, total, pct: 0, label: "Starting video tools…" });
+  const ff = await getFFmpeg(undefined, signal);
 
   let aborted = false;
   const onAbortDuringExec = () => {
@@ -226,64 +242,128 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   };
   signal?.addEventListener("abort", onAbortDuringExec);
 
-  if (_logHandler) {
-    try { ff.off("log", _logHandler); } catch { /* ignore */ }
-  }
   if (_progressHandler) {
     try { ff.off("progress", _progressHandler); } catch { /* ignore */ }
   }
 
   let currentChunk = 0;
+  let progressStage = "Preparing video";
 
   _progressHandler = ({ progress }) => {
     const ratio = Math.max(0, Math.min(1, progress));
     const overallPct = Math.round(((currentChunk + ratio) / total) * 100);
     const sourceChunkNumber = chunkIndices[currentChunk] + 1;
+    const isSplitting = progressStage === "Splitting video";
     onProgress({
-      current: currentChunk + ratio,
-      total,
-      pct: overallPct,
-      label: `Processing chunk ${sourceChunkNumber} of ${chunkCount} (${Math.round(ratio * 100)}%)`,
+      current: isSplitting ? ratio : currentChunk + ratio,
+      total: isSplitting ? 1 : total,
+      pct: isSplitting ? Math.round(ratio * 90) : overallPct,
+      label: isSplitting
+        ? `Splitting video · ${Math.round(ratio * 100)}%`
+        : `Exporting chunk ${sourceChunkNumber} of ${chunkCount} · ${Math.round(ratio * 100)}%`,
     });
   };
 
-  _logHandler = ({ message }) => {
-    const ignorePatterns = [
-      /frame=.*fps=.*q=/i,
-      /Past duration.*too large/i,
-      /buffer is too small/i,
-    ];
-    
-    const shouldIgnore = ignorePatterns.some(pattern => pattern.test(message));
-    if (shouldIgnore && !message.includes("error") && !message.includes("Error")) {
-      return;
-    }
-    
-    try {
-      onProgress({
-        current: currentChunk,
-        total,
-        pct: 0,
-        label: message.length > 100 ? message.substring(0, 100) + "..." : message,
-      });
-    } catch { /* ignore */ }
-  };
-
   try { ff.on("progress", _progressHandler); } catch { /* ignore */ }
-  try { ff.on("log", _logHandler); } catch { /* ignore */ }
 
   try {
-    onProgress({ current: 0, total, pct: 0, label: "Preparing video…" });
+    onProgress({ current: 0, total, pct: 2, label: "Reading your video…" });
     await ff.writeFile("input.mp4", await fetchFile(video.file));
 
     const active = overlays.filter((o) => o.visible);
+    const output = getReframeGeometry(video.width, video.height, reframeMode);
+    const needsReframe = reframeMode === "short";
+
+    if (active.length === 0 && !needsReframe) {
+      const { extension, mimeType, format } = getSourceContainer(video.name);
+      const outputPattern = `chunk_%03d.${extension}`;
+      const existingFiles = await ff.listDir("/");
+      for (const entry of existingFiles) {
+        if (!entry.isDir && /^chunk_\d+\.(mp4|mov|mkv|webm)$/i.test(entry.name)) {
+          await ff.deleteFile(entry.name);
+        }
+      }
+
+      progressStage = "Splitting video";
+      onProgress({ current: 0, total, pct: 2, label: "Splitting video into chunks…" });
+      await ff.exec([
+        "-i", "input.mp4",
+        "-map", "0",
+        "-c", "copy",
+        "-f", "segment",
+        "-segment_time", chunkSeconds.toFixed(3),
+        "-segment_start_number", "1",
+        "-reset_timestamps", "1",
+        "-segment_format", format,
+        outputPattern,
+      ]);
+
+      const outputNames = (await ff.listDir("/"))
+        .filter((entry) => !entry.isDir && /^chunk_\d+\.(mp4|mov|mkv|webm)$/i.test(entry.name))
+        .map((entry) => entry.name)
+        .sort();
+      if (outputNames.length === 0) {
+        throw new Error("FFmpeg completed without producing any video chunks.");
+      }
+
+      const selectedNames =
+        chunkIndex === undefined
+          ? outputNames
+          : outputNames[chunkIndex]
+            ? [outputNames[chunkIndex]]
+            : [];
+      if (selectedNames.length === 0) {
+        throw new RangeError(
+          `Chunk ${chunkIndex! + 1} is unavailable. Keyframe-aligned splitting produced ${outputNames.length} chunks.`,
+        );
+      }
+
+      const results: ChunkResult[] = [];
+      for (const name of outputNames) {
+        if (!selectedNames.includes(name)) {
+          await ff.deleteFile(name);
+          continue;
+        }
+        const bytes = await ff.readFile(name) as Uint8Array;
+        const ab = bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        ) as ArrayBuffer;
+        const blob = new Blob([ab], { type: mimeType });
+        results.push({
+          id: crypto.randomUUID(),
+          name,
+          blob,
+          url: URL.createObjectURL(blob),
+          size: blob.size,
+        });
+        await ff.deleteFile(name);
+        const savingProgress = Math.round(90 + (results.length / selectedNames.length) * 10);
+        onProgress({
+          current: results.length,
+          total: selectedNames.length,
+          pct: savingProgress,
+          label: `Saving chunk ${results.length} of ${selectedNames.length}…`,
+        });
+      }
+
+      try { await ff.deleteFile("input.mp4"); } catch { /* ignore */ }
+      onProgress({
+        current: selectedNames.length,
+        total: selectedNames.length,
+        pct: 100,
+        label: `Finished · ${selectedNames.length} chunk${selectedNames.length === 1 ? "" : "s"} ready`,
+      });
+      return results;
+    }
+
     for (let i = 0; i < active.length; i++) {
       const o = active[i];
-      onProgress({ 
-        current: 0, 
-        total, 
-        pct: 0, 
-        label: `Loading overlay ${i + 1}/${active.length}: ${o.file.name}` 
+      onProgress({
+        current: 0,
+        total,
+        pct: 2,
+        label: `Preparing overlay ${i + 1} of ${active.length}…`,
       });
       await ff.writeFile(`ov${i}.png`, await fetchFile(o.file));
     }
@@ -305,83 +385,68 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         current: position,
         total,
         pct: Math.round((position / total) * 100),
-        label: `Processing chunk ${i + 1} of ${chunkCount}…`,
+        label: `Preparing chunk ${i + 1} of ${chunkCount}…`,
       });
+      progressStage = "Exporting chunk";
 
       const args: string[] = ["-i", "input.mp4"];
       for (let k = 0; k < active.length; k++) args.push("-i", `ov${k}.png`);
       args.push("-ss", start.toFixed(3), "-t", dur.toFixed(3));
 
-      const output = getReframeGeometry(video.width, video.height, reframeMode);
-      const needsReframe = reframeMode === "short";
+      const W = output.outputWidth;
+      const H = output.outputHeight;
+      const filters: string[] = [];
+      let last = "[0:v]";
 
-      if (active.length === 0 && !needsReframe) {
-        args.push(
-          "-c:v", "libx264",
-          "-preset", "veryfast",
-          "-crf", "26",
-          "-pix_fmt", "yuv420p",
-          "-c:a", "aac",
-          "-b:a", "128k",
-          "-movflags", "+faststart",
-          outName,
+      if (needsReframe) {
+        filters.push(
+          `[0:v]crop=${output.cropWidth}:${output.cropHeight}:${output.cropX}:${output.cropY},` +
+          `scale=${output.outputWidth}:${output.outputHeight}[base]`,
         );
-      } else {
-        const W = output.outputWidth;
-        const H = output.outputHeight;
-        const filters: string[] = [];
-        let last = "[0:v]";
-
-        if (needsReframe) {
-          filters.push(
-            `[0:v]crop=${output.cropWidth}:${output.cropHeight}:${output.cropX}:${output.cropY},` +
-            `scale=${output.outputWidth}:${output.outputHeight}[base]`,
-          );
-          last = "[base]";
-        }
-
-        const sorted = [...active]
-          .map((o, idx) => ({ o, idx }))
-          .sort((a, b) => a.o.z - b.o.z);
-
-        sorted.forEach(({ o, idx }, n) => {
-          const tw = Math.max(2, Math.round(o.w * W));
-          const th = Math.max(2, Math.round(o.h * H));
-          const alpha = Math.max(0, Math.min(1, o.opacity));
-          filters.push(
-            `[${idx + 1}:v]scale=${tw}:${th}:force_original_aspect_ratio=decrease,` +
-            `pad=${tw}:${th}:(ow-iw)/2:(oh-ih)/2:color=black@0,` +
-            `format=rgba,` +
-            `lutrgb=a='val*${alpha.toFixed(4)}'` +
-            `[ov${n}]`,
-          );
-        });
-
-        sorted.forEach(({ o }, n) => {
-          const x = Math.round(o.x * W);
-          const y = Math.round(o.y * H);
-          const nextLabel = n === sorted.length - 1 ? "vout" : `tmp${n}`;
-          filters.push(`${last}[ov${n}]overlay=${x}:${y}[${nextLabel}]`);
-          last = `[${nextLabel}]`;
-        });
-
-        const finalVideoLabel = active.length ? "[vout]" : last;
-
-        args.push(
-          "-filter_complex", filters.join(";"),
-          "-map", finalVideoLabel,
-          "-map", "0:a?",
-          "-shortest",
-          "-c:v", "libx264",
-          "-preset", "veryfast",
-          "-crf", "26",
-          "-pix_fmt", "yuv420p",
-          "-c:a", "aac",
-          "-b:a", "128k",
-          "-movflags", "+faststart",
-          outName,
-        );
+        last = "[base]";
       }
+
+      const sorted = [...active]
+        .map((o, idx) => ({ o, idx }))
+        .sort((a, b) => a.o.z - b.o.z);
+
+      sorted.forEach(({ o, idx }, n) => {
+        const tw = Math.max(2, Math.round(o.w * W));
+        const th = Math.max(2, Math.round(o.h * H));
+        const alpha = Math.max(0, Math.min(1, o.opacity));
+        filters.push(
+          `[${idx + 1}:v]scale=${tw}:${th}:force_original_aspect_ratio=decrease,` +
+          `pad=${tw}:${th}:(ow-iw)/2:(oh-ih)/2:color=black@0,` +
+          `format=rgba,` +
+          `lutrgb=a='val*${alpha.toFixed(4)}'` +
+          `[ov${n}]`,
+        );
+      });
+
+      sorted.forEach(({ o }, n) => {
+        const x = Math.round(o.x * W);
+        const y = Math.round(o.y * H);
+        const nextLabel = n === sorted.length - 1 ? "vout" : `tmp${n}`;
+        filters.push(`${last}[ov${n}]overlay=${x}:${y}[${nextLabel}]`);
+        last = `[${nextLabel}]`;
+      });
+
+      const finalVideoLabel = active.length ? "[vout]" : last;
+
+      args.push(
+        "-filter_complex", filters.join(";"),
+        "-map", finalVideoLabel,
+        "-map", "0:a?",
+        "-shortest",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        outName,
+      );
 
       try {
         await ff.exec(args);
@@ -421,7 +486,7 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
         current: position + 1,
         total,
         pct: Math.round(((position + 1) / total) * 100),
-        label: `✅ Finished chunk ${i + 1} of ${chunkCount}`,
+        label: `Finished chunk ${i + 1} of ${chunkCount}`,
       });
     }
 
@@ -439,10 +504,6 @@ export async function processVideo(opts: ProcessOpts): Promise<ChunkResult[]> {
   } finally {
     signal?.removeEventListener("abort", onAbortDuringExec);
     if (!aborted && _ffmpeg === ff) {
-      if (_logHandler) {
-        try { ff.off("log", _logHandler); } catch { /* ignore */ }
-        _logHandler = null;
-      }
       if (_progressHandler) {
         try { ff.off("progress", _progressHandler); } catch { /* ignore */ }
         _progressHandler = null;
